@@ -6,12 +6,20 @@ from datetime import datetime
 import base64
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import numpy as np
 
 # ==============================
 # APP CONFIG
 # ==============================
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
+
+# ==============================
+# LOAD DEEPFACE MODEL ONCE
+# ==============================
+print("Loading Facenet model...")
+model = DeepFace.build_model("Facenet")
+print("Model loaded successfully.")
 
 # ==============================
 # LOAD REGISTERED EMPLOYEES
@@ -57,11 +65,10 @@ def register_page():
     return render_template("register.html")
 
 # ==============================
-# REGISTER FACE (DeepFace)
+# REGISTER FACE
 # ==============================
 @app.route("/register_face", methods=["POST"])
 def register_face():
-
     try:
         data = request.json
         emp_id = data["employee_id"].strip()
@@ -71,14 +78,11 @@ def register_face():
         if not emp_id or not work_mode:
             return jsonify({"status": "Emp_ID and Work Mode required"})
 
-        # 🔐 Validate from Employees_Master
+        # Validate employee from sheet
         master_records = employees_master_sheet.get_all_records()
-        employee_record = None
-
-        for record in master_records:
-            if str(record["Emp_ID"]) == str(emp_id):
-                employee_record = record
-                break
+        employee_record = next(
+            (r for r in master_records if str(r["Emp_ID"]) == str(emp_id)), None
+        )
 
         if not employee_record:
             return jsonify({"status": "Emp_ID not found in Employees_Master"})
@@ -92,30 +96,31 @@ def register_face():
                 "employee": employees[emp_id]["name"]
             })
 
-        # Save image temporarily
         temp_path = f"temp_{emp_id}.jpg"
         with open(temp_path, "wb") as f:
             f.write(image_data)
 
-        # Generate embedding
-        embedding = DeepFace.represent(
+        representation = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
-            enforce_detection=True
-        )[0]["embedding"]
+            model=model,
+            detector_backend="opencv",
+            enforce_detection=False
+        )
 
         os.remove(temp_path)
 
-        # Store embedding in JSON
+        embedding = representation[0]["embedding"]
+
         employees[emp_id] = {
             "name": employee_record["Name"],
             "email": employee_record["Email"],
             "work_mode": work_mode,
-            "embedding": embedding
+            "embedding": list(map(float, embedding))
         }
 
         with open("employees.json", "w") as f:
-            json.dump(employees, f)
+            json.dump(employees, f, indent=4)
 
         return jsonify({
             "status": "REGISTERED",
@@ -125,66 +130,62 @@ def register_face():
     except Exception as e:
         return jsonify({"status": f"Registration error: {str(e)}"})
 
-
 # ==============================
-# VERIFY & MARK ATTENDANCE
+# VERIFY FACE
 # ==============================
 @app.route("/verify", methods=["POST"])
 def verify():
-
     try:
-        image_data = base64.b64decode(request.json["image"].split(",")[1])
-
         if not employees:
             return jsonify({"status": "No registered employees"})
+
+        image_data = base64.b64decode(request.json["image"].split(",")[1])
 
         temp_path = "temp_verify.jpg"
         with open(temp_path, "wb") as f:
             f.write(image_data)
 
-        # Generate embedding for incoming face
-        unknown_embedding = DeepFace.represent(
+        representation = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
-            enforce_detection=True
-        )[0]["embedding"]
+            model=model,
+            detector_backend="opencv",
+            enforce_detection=False
+        )
 
         os.remove(temp_path)
+
+        unknown_embedding = np.array(representation[0]["embedding"])
 
         best_match_id = None
         best_distance = 999
 
-        # Compare embeddings manually (cosine distance)
-        from numpy import dot
-        from numpy.linalg import norm
-
         for emp_id, data in employees.items():
-
-            stored_embedding = data["embedding"]
+            stored_embedding = np.array(data["embedding"])
 
             cosine_distance = 1 - (
-                dot(unknown_embedding, stored_embedding)
-                / (norm(unknown_embedding) * norm(stored_embedding))
+                np.dot(unknown_embedding, stored_embedding)
+                / (np.linalg.norm(unknown_embedding) * np.linalg.norm(stored_embedding))
             )
 
             if cosine_distance < best_distance:
                 best_distance = cosine_distance
                 best_match_id = emp_id
 
-        # Threshold (tuned for Facenet)
+        # Threshold for Facenet
         if best_distance > 0.4:
             return jsonify({"status": "Face not recognized"})
 
-        emp_id = best_match_id
-        emp_data = employees[emp_id]
+        emp_data = employees[best_match_id]
 
-        # 🔐 Re-check Active Status
+        # Re-check Active Status
         master_records = employees_master_sheet.get_all_records()
-        for record in master_records:
-            if str(record["Emp_ID"]) == str(emp_id):
-                if record["Status"].strip().lower() != "active":
-                    return jsonify({"status": "Employee not Active"})
-                break
+        record = next(
+            (r for r in master_records if str(r["Emp_ID"]) == str(best_match_id)), None
+        )
+
+        if not record or record["Status"].strip().lower() != "active":
+            return jsonify({"status": "Employee not Active"})
 
         now = datetime.now()
         timestamp = now.strftime("%d/%m/%Y %H:%M:%S")
@@ -192,27 +193,26 @@ def verify():
         excel_start = datetime(1899, 12, 30)
         attendance_date_number = (now - excel_start).days
 
-        unique_key = f"{emp_id}_{attendance_date_number}"
+        unique_key = f"{best_match_id}_{attendance_date_number}"
 
-        # 🚨 STRICT duplicate prevention
         records = attendance_sheet.get_all_records()
 
         for record in records:
             if (
-                str(record["Employee ID"]) == str(emp_id)
+                str(record["Employee ID"]) == str(best_match_id)
                 and str(record["Attendance_Date"]) == str(attendance_date_number)
             ):
                 return jsonify({
                     "status": "ALREADY_MARKED",
                     "employee": emp_data["name"],
-                    "emp_id": emp_id
+                    "emp_id": best_match_id
                 })
 
         row = [
             timestamp,
             emp_data["email"],
             emp_data["name"],
-            emp_id,
+            best_match_id,
             emp_data["work_mode"],
             "",
             unique_key,
@@ -225,15 +225,15 @@ def verify():
         return jsonify({
             "status": "SUCCESS",
             "employee": emp_data["name"],
-            "emp_id": emp_id
+            "emp_id": best_match_id
         })
 
     except Exception as e:
         return jsonify({"status": f"Attendance error: {str(e)}"})
 
-
 # ==============================
-# RUN APP
+# RUN (Render Compatible)
 # ==============================
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
