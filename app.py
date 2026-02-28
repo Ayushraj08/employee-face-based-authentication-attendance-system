@@ -1,6 +1,5 @@
 from flask import Flask, render_template, request, jsonify
-import face_recognition
-import numpy as np
+from deepface import DeepFace
 import os
 import json
 from datetime import datetime
@@ -14,9 +13,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-# Ensure folders exist
-os.makedirs("encodings", exist_ok=True)
-
 # ==============================
 # LOAD REGISTERED EMPLOYEES
 # ==============================
@@ -27,27 +23,7 @@ else:
     employees = {}
 
 # ==============================
-# LOAD FACE ENCODINGS
-# ==============================
-known_face_encodings = []
-known_face_ids = []
-
-def load_encodings():
-    global known_face_encodings, known_face_ids
-    known_face_encodings = []
-    known_face_ids = []
-
-    for emp_id in employees:
-        encoding_path = f"encodings/{emp_id}.npy"
-        if os.path.exists(encoding_path):
-            encoding = np.load(encoding_path)
-            known_face_encodings.append(encoding)
-            known_face_ids.append(emp_id)
-
-load_encodings()
-
-# ==============================
-# GOOGLE SHEETS SETUP (SECURE)
+# GOOGLE SHEETS SETUP
 # ==============================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -81,7 +57,7 @@ def register_page():
     return render_template("register.html")
 
 # ==============================
-# ENTERPRISE REGISTER FACE
+# REGISTER FACE (DeepFace)
 # ==============================
 @app.route("/register_face", methods=["POST"])
 def register_face():
@@ -95,7 +71,7 @@ def register_face():
         if not emp_id or not work_mode:
             return jsonify({"status": "Emp_ID and Work Mode required"})
 
-        # Validate from Employees_Master
+        # 🔐 Validate from Employees_Master
         master_records = employees_master_sheet.get_all_records()
         employee_record = None
 
@@ -116,31 +92,30 @@ def register_face():
                 "employee": employees[emp_id]["name"]
             })
 
-        # Process face image
-        with open("temp.jpg", "wb") as f:
+        # Save image temporarily
+        temp_path = f"temp_{emp_id}.jpg"
+        with open(temp_path, "wb") as f:
             f.write(image_data)
 
-        image = face_recognition.load_image_file("temp.jpg")
-        encodings = face_recognition.face_encodings(image)
+        # Generate embedding
+        embedding = DeepFace.represent(
+            img_path=temp_path,
+            model_name="Facenet",
+            enforce_detection=True
+        )[0]["embedding"]
 
-        os.remove("temp.jpg")
+        os.remove(temp_path)
 
-        if not encodings:
-            return jsonify({"status": "No face detected"})
-
-        encoding = encodings[0]
-        np.save(f"encodings/{emp_id}.npy", encoding)
-
+        # Store embedding in JSON
         employees[emp_id] = {
             "name": employee_record["Name"],
             "email": employee_record["Email"],
-            "work_mode": work_mode
+            "work_mode": work_mode,
+            "embedding": embedding
         }
 
         with open("employees.json", "w") as f:
-            json.dump(employees, f, indent=4)
-
-        load_encodings()
+            json.dump(employees, f)
 
         return jsonify({
             "status": "REGISTERED",
@@ -160,92 +135,105 @@ def verify():
     try:
         image_data = base64.b64decode(request.json["image"].split(",")[1])
 
-        with open("temp.jpg", "wb") as f:
+        if not employees:
+            return jsonify({"status": "No registered employees"})
+
+        temp_path = "temp_verify.jpg"
+        with open(temp_path, "wb") as f:
             f.write(image_data)
 
-        image = face_recognition.load_image_file("temp.jpg")
-        encodings = face_recognition.face_encodings(image)
+        # Generate embedding for incoming face
+        unknown_embedding = DeepFace.represent(
+            img_path=temp_path,
+            model_name="Facenet",
+            enforce_detection=True
+        )[0]["embedding"]
 
-        os.remove("temp.jpg")
+        os.remove(temp_path)
 
-        if not encodings:
-            return jsonify({"status": "No face detected"})
+        best_match_id = None
+        best_distance = 999
 
-        if not known_face_encodings:
-            return jsonify({"status": "No registered employees"})
+        # Compare embeddings manually (cosine distance)
+        from numpy import dot
+        from numpy.linalg import norm
 
-        unknown_encoding = encodings[0]
+        for emp_id, data in employees.items():
 
-        matches = face_recognition.compare_faces(known_face_encodings, unknown_encoding)
-        distances = face_recognition.face_distance(known_face_encodings, unknown_encoding)
+            stored_embedding = data["embedding"]
 
-        if len(distances) == 0:
-            return jsonify({"status": "No registered employees"})
+            cosine_distance = 1 - (
+                dot(unknown_embedding, stored_embedding)
+                / (norm(unknown_embedding) * norm(stored_embedding))
+            )
 
-        best_match_index = np.argmin(distances)
+            if cosine_distance < best_distance:
+                best_distance = cosine_distance
+                best_match_id = emp_id
 
-        if matches[best_match_index] and distances[best_match_index] < 0.45:
+        # Threshold (tuned for Facenet)
+        if best_distance > 0.4:
+            return jsonify({"status": "Face not recognized"})
 
-            emp_id = known_face_ids[best_match_index]
-            emp_data = employees[emp_id]
+        emp_id = best_match_id
+        emp_data = employees[emp_id]
 
-            # Re-check Active Status
-            master_records = employees_master_sheet.get_all_records()
-            for record in master_records:
-                if str(record["Emp_ID"]) == str(emp_id):
-                    if record["Status"].strip().lower() != "active":
-                        return jsonify({"status": "Employee not Active"})
-                    break
+        # 🔐 Re-check Active Status
+        master_records = employees_master_sheet.get_all_records()
+        for record in master_records:
+            if str(record["Emp_ID"]) == str(emp_id):
+                if record["Status"].strip().lower() != "active":
+                    return jsonify({"status": "Employee not Active"})
+                break
 
-            now = datetime.now()
-            timestamp = now.strftime("%d/%m/%Y %H:%M:%S")
+        now = datetime.now()
+        timestamp = now.strftime("%d/%m/%Y %H:%M:%S")
 
-            excel_start = datetime(1899, 12, 30)
-            attendance_date_number = (now - excel_start).days
+        excel_start = datetime(1899, 12, 30)
+        attendance_date_number = (now - excel_start).days
 
-            unique_key = f"{emp_id}_{attendance_date_number}"
+        unique_key = f"{emp_id}_{attendance_date_number}"
 
-            records = attendance_sheet.get_all_records()
+        # 🚨 STRICT duplicate prevention
+        records = attendance_sheet.get_all_records()
 
-            for record in records:
-                if (
-                    str(record["Employee ID"]) == str(emp_id)
-                    and str(record["Attendance_Date"]) == str(attendance_date_number)
-                ):
-                    return jsonify({
-                        "status": "ALREADY_MARKED",
-                        "employee": emp_data["name"],
-                        "emp_id": emp_id
-                    })
+        for record in records:
+            if (
+                str(record["Employee ID"]) == str(emp_id)
+                and str(record["Attendance_Date"]) == str(attendance_date_number)
+            ):
+                return jsonify({
+                    "status": "ALREADY_MARKED",
+                    "employee": emp_data["name"],
+                    "emp_id": emp_id
+                })
 
-            row = [
-                timestamp,
-                emp_data["email"],
-                emp_data["name"],
-                emp_id,
-                emp_data["work_mode"],
-                "",
-                unique_key,
-                attendance_date_number,
-                "VALID"
-            ]
+        row = [
+            timestamp,
+            emp_data["email"],
+            emp_data["name"],
+            emp_id,
+            emp_data["work_mode"],
+            "",
+            unique_key,
+            attendance_date_number,
+            "VALID"
+        ]
 
-            attendance_sheet.append_row(row)
+        attendance_sheet.append_row(row)
 
-            return jsonify({
-                "status": "SUCCESS",
-                "employee": emp_data["name"],
-                "emp_id": emp_id
-            })
-
-        return jsonify({"status": "Face not recognized"})
+        return jsonify({
+            "status": "SUCCESS",
+            "employee": emp_data["name"],
+            "emp_id": emp_id
+        })
 
     except Exception as e:
         return jsonify({"status": f"Attendance error: {str(e)}"})
 
 
 # ==============================
-# RUN APP (Gunicorn will use this)
+# RUN APP
 # ==============================
 if __name__ == "__main__":
     app.run()
