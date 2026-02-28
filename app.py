@@ -1,6 +1,9 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 from flask import Flask, render_template, request, jsonify
 from deepface import DeepFace
-import os
 import json
 from datetime import datetime
 import base64
@@ -13,13 +16,6 @@ import numpy as np
 # ==============================
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
-
-# ==============================
-# LOAD DEEPFACE MODEL ONCE
-# ==============================
-print("Loading Facenet model...")
-model = DeepFace.build_model("Facenet")
-print("Model loaded successfully.")
 
 # ==============================
 # LOAD REGISTERED EMPLOYEES
@@ -39,7 +35,6 @@ scope = [
 ]
 
 google_creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-
 if not google_creds_json:
     raise Exception("GOOGLE_CREDENTIALS environment variable not set.")
 
@@ -78,7 +73,7 @@ def register_face():
         if not emp_id or not work_mode:
             return jsonify({"status": "Emp_ID and Work Mode required"})
 
-        # Validate employee from sheet
+        # Validate employee
         master_records = employees_master_sheet.get_all_records()
         employee_record = next(
             (r for r in master_records if str(r["Emp_ID"]) == str(emp_id)), None
@@ -103,7 +98,6 @@ def register_face():
         representation = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
-            model=model,
             detector_backend="opencv",
             enforce_detection=False
         )
@@ -148,7 +142,6 @@ def verify():
         representation = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
-            model=model,
             detector_backend="opencv",
             enforce_detection=False
         )
@@ -172,7 +165,6 @@ def verify():
                 best_distance = cosine_distance
                 best_match_id = emp_id
 
-        # Threshold for Facenet
         if best_distance > 0.4:
             return jsonify({"status": "Face not recognized"})
 
@@ -197,10 +189,10 @@ def verify():
 
         records = attendance_sheet.get_all_records()
 
-        for record in records:
+        for r in records:
             if (
-                str(record["Employee ID"]) == str(best_match_id)
-                and str(record["Attendance_Date"]) == str(attendance_date_number)
+                str(r["Employee ID"]) == str(best_match_id)
+                and str(r["Attendance_Date"]) == str(attendance_date_number)
             ):
                 return jsonify({
                     "status": "ALREADY_MARKED",
@@ -232,7 +224,7 @@ def verify():
         return jsonify({"status": f"Attendance error: {str(e)}"})
 
 # ==============================
-# RUN (Render Compatible)
+# RUN
 # ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
