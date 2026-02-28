@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>viTan Attendance</title>
+    <link rel="stylesheet" href="/static/style.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+
+<div class="container">
+
+    <img src="/static/logo.png" class="logo" alt="viTan Logo">
+
+    <div class="subtitle">
+        Face Authentication Attendance
+    </div>
+
+    <video id="video" autoplay playsinline></video>
+
+    <div class="status" id="blinkStatus">
+        Please blink to verify
+    </div>
+
+    <button id="attendanceBtn" onclick="captureAttendance()" class="btn">
+        Mark Attendance
+    </button>
+
+    <!-- Spinner -->
+    <div class="spinner" id="spinner"></div>
+
+    <!-- Success & Error Boxes -->
+    <div class="success-box" id="successBox"></div>
+    <div class="error-box" id="errorBox"></div>
+
+    <a href="/register" class="link">
+        Register New Employee
+    </a>
+
+    <div class="footer">
+        © viTan HR System
+    </div>
+
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>

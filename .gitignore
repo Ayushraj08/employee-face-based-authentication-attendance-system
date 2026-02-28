@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+credentials.json
+encodings/
+employees.json
+temp.jpg
+logs/
